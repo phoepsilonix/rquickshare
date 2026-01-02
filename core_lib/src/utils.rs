@@ -11,16 +11,13 @@ use num_bigint::{BigUint, ToBigInt};
 use p256::elliptic_curve::rand_core::OsRng;
 use p256::{PublicKey, SecretKey};
 use rand::{Rng, RngCore};
-use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-use ts_rs::TS;
 
 use crate::CUSTOM_DOWNLOAD;
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Serialize, TS)]
-#[ts(export)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum DeviceType {
     Unknown = 0,
@@ -42,8 +39,7 @@ impl DeviceType {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, TS)]
-#[ts(export)]
+#[derive(Debug, Clone)]
 pub struct RemoteDeviceInfo {
     pub name: String,
     pub device_type: DeviceType,

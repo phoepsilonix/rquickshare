@@ -10,8 +10,8 @@ use channel::ChannelMessage;
 use hdl::BleAdvertiser;
 use hdl::MDnsDiscovery;
 use once_cell::sync::Lazy;
-use rand::distr::Alphanumeric;
 use rand::Rng;
+use rand::distr::Alphanumeric;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -23,12 +23,12 @@ use crate::hdl::MDnsServer;
 use crate::manager::TcpServer;
 
 pub mod channel;
-mod errors;
-mod hdl;
-mod manager;
-mod utils;
+pub mod errors;
+pub mod hdl;
+pub mod manager;
+pub mod utils;
 
-pub use hdl::{EndpointInfo, OutboundPayload, State, Visibility};
+pub use hdl::{EndpointInfo, OutboundPayload, TransferState, Visibility};
 pub use manager::SendInfo;
 pub use utils::DeviceType;
 
@@ -49,6 +49,8 @@ pub mod location_nearby_connections {
 }
 
 static CUSTOM_DOWNLOAD: Lazy<RwLock<Option<PathBuf>>> = Lazy::new(|| RwLock::new(None));
+static DEVICE_NAME: Lazy<RwLock<String>> =
+    Lazy::new(|| RwLock::new(sys_metrics::host::get_hostname().unwrap_or("Unknown device".into())));
 
 #[derive(Debug)]
 pub struct RQS {
@@ -65,14 +67,19 @@ pub struct RQS {
     // Only used to send the info "a nearby device is sharing"
     ble_sender: broadcast::Sender<()>,
 
-    port_number: Option<u32>,
+    pub port_number: Option<u32>,
 
     pub message_sender: broadcast::Sender<ChannelMessage>,
 }
 
 impl Default for RQS {
     fn default() -> Self {
-        Self::new(Visibility::Visible, None, None)
+        Self::new(
+            Visibility::Visible,
+            None,
+            None,
+            Some(sys_metrics::host::get_hostname().unwrap_or("Unknown device".into())),
+        )
     }
 }
 
@@ -81,9 +88,18 @@ impl RQS {
         visibility: Visibility,
         port_number: Option<u32>,
         download_path: Option<PathBuf>,
+        device_name: Option<String>,
     ) -> Self {
-        let mut guard = CUSTOM_DOWNLOAD.write().unwrap();
-        *guard = download_path;
+        {
+            let mut guard = CUSTOM_DOWNLOAD.write().unwrap();
+            *guard = download_path;
+        }
+        {
+            let mut guard = DEVICE_NAME.write().unwrap();
+            if let Some(device_name) = device_name {
+                *guard = device_name.clone();
+            }
+        }
 
         let (message_sender, _) = broadcast::channel(50);
         let (ble_sender, _) = broadcast::channel(5);
@@ -122,6 +138,11 @@ impl RQS {
         let binded_addr = tcp_listener.local_addr()?;
         info!("TcpListener on: {}", binded_addr);
 
+        // So the random port can be accessed from the user if needed.
+        // This does have a difference in behaviour however when port_number is Some.
+        // .stop() and .run() will reuse the port number instead of generating a new one.
+        self.port_number = Some(binded_addr.port() as u32);
+
         // MPSC for the TcpServer
         let send_channel = mpsc::channel(10);
         // Start TcpServer in own "task"
@@ -136,8 +157,10 @@ impl RQS {
 
         #[cfg(feature = "experimental")]
         {
-            // Don't threat BleListener error as fatal, it's a nice to have.
-            if let Ok(ble) = BleListener::new(self.ble_sender.clone()).await {
+            if let Ok(ble) = BleListener::new(self.ble_sender.clone())
+                .await
+                .inspect_err(|err| warn!("BleListener: {}", err))
+            {
                 let ctk = ctoken.clone();
                 tracker.spawn(async move { ble.run(ctk).await });
             }
@@ -217,6 +240,11 @@ impl RQS {
         }
 
         if let Some(tracker) = &self.tracker {
+            // Inorder for TaskTracker::wait to return, close() must be called
+            // and the count of tasks being watched should be 0 (i.e. they've all closed).
+            //
+            // If not, the TaskTracker may forever wait if task count is 0 when wait() was called
+            tracker.close();
             tracker.wait().await;
         }
 
@@ -229,5 +257,19 @@ impl RQS {
         debug!("Setting the download path to {:?}", p);
         let mut guard = CUSTOM_DOWNLOAD.write().unwrap();
         *guard = p;
+    }
+
+    /// For this to properly take effect,
+    /// `MdnsServer` would need to be reset which is done by `RQS::stop` followed by `RQS::run`.
+    ///
+    /// So only do this when no data transfer is going on.
+    pub fn set_device_name(&self, name: String) {
+        debug!("Setting the device name {:?}", name);
+        let mut guard = DEVICE_NAME.write().unwrap();
+        *guard = name;
+    }
+
+    pub fn get_device_name(&self) -> String {
+        DEVICE_NAME.read().unwrap().clone()
     }
 }

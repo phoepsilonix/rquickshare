@@ -1,11 +1,12 @@
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
-use libaes::{Cipher, AES_256_KEY_LEN};
+use libaes::{AES_256_KEY_LEN, Cipher};
 use p256::ecdh::diffie_hellman;
 use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use p256::{EncodedPoint, PublicKey};
@@ -16,27 +17,28 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::broadcast::{Receiver, Sender};
 
-use super::{InnerState, State};
-use crate::channel::{ChannelAction, ChannelDirection, ChannelMessage};
-use crate::hdl::info::{InternalFileInfo, TransferMetadata};
-use crate::hdl::{TextPayloadInfo, TextPayloadType};
+use super::{InnerState, TransferState};
+use crate::channel::{self, ChannelMessage, MessageClient, TransferAction, TransferKind};
+use crate::hdl::TextPayloadInfo;
+use crate::hdl::info::{InternalFileInfo, TransferMetadata, TransferPayload, TransferPayloadKind};
 use crate::location_nearby_connections::payload_transfer_frame::{
-    payload_header, PacketType, PayloadChunk, PayloadHeader,
+    PacketType, PayloadChunk, PayloadHeader, payload_header,
 };
 use crate::location_nearby_connections::{KeepAliveFrame, OfflineFrame, PayloadTransferFrame};
 use crate::securegcm::ukey2_alert::AlertType;
 use crate::securegcm::{
-    ukey2_message, DeviceToDeviceMessage, GcmMetadata, Type, Ukey2Alert, Ukey2ClientFinished,
-    Ukey2ClientInit, Ukey2HandshakeCipher, Ukey2Message, Ukey2ServerInit,
+    DeviceToDeviceMessage, GcmMetadata, Type, Ukey2Alert, Ukey2ClientFinished, Ukey2ClientInit,
+    Ukey2HandshakeCipher, Ukey2Message, Ukey2ServerInit, ukey2_message,
 };
 use crate::securemessage::{
     EcP256PublicKey, EncScheme, GenericPublicKey, Header, HeaderAndBody, PublicKeyType,
     SecureMessage, SigScheme,
 };
+use crate::sharing_nearby::wifi_credentials_metadata::SecurityType;
 use crate::sharing_nearby::{paired_key_result_frame, text_metadata};
 use crate::utils::{
-    encode_point, gen_ecdsa_keypair, gen_random, get_download_dir, hkdf_extract_expand,
-    stream_read_exact, to_four_digit_string, DeviceType, RemoteDeviceInfo,
+    DeviceType, RemoteDeviceInfo, encode_point, gen_ecdsa_keypair, gen_random, get_download_dir,
+    hkdf_extract_expand, stream_read_exact, to_four_digit_string,
 };
 use crate::{location_nearby_connections, sharing_nearby};
 
@@ -63,7 +65,7 @@ impl InboundRequest {
                 id,
                 server_seq: 0,
                 client_seq: 0,
-                state: State::Initial,
+                state: TransferState::Initial,
                 encryption_done: true,
                 ..Default::default()
             },
@@ -80,46 +82,42 @@ impl InboundRequest {
             i = self.receiver.recv() => {
                 match i {
                     Ok(channel_msg) => {
-                        if channel_msg.direction == ChannelDirection::LibToFront {
-                            return Ok(());
-                        }
-
                         if channel_msg.id != self.state.id {
                             return Ok(());
                         }
 
-                        debug!("inbound: got: {:?}", channel_msg);
-                        match channel_msg.action {
-                            Some(ChannelAction::AcceptTransfer) => {
-                                self.accept_transfer().await?;
-                            },
-                            Some(ChannelAction::RejectTransfer) => {
-                                self.update_state(
-                                    |e| {
-                                        e.state = State::Rejected;
-                                    },
-                                    true,
-                                ).await;
+                        if let channel::Message::Lib { action } = &channel_msg.msg {
+                            debug!("inbound: got: {:?}", channel_msg);
+                            match action {
+                                TransferAction::ConsentAccept => {
+                                    self.accept_transfer().await?;
+                                },
+                                TransferAction::ConsentDecline => {
+                                    self.update_state(
+                                        |e| {
+                                            e.state = TransferState::Rejected;
+                                        },
+                                        true,
+                                    ).await;
 
-                                self.reject_transfer(Some(
-                                    sharing_nearby::connection_response_frame::Status::Reject
-                                )).await?;
-                                return Err(anyhow!(crate::errors::AppError::NotAnError));
-                            },
-                            Some(ChannelAction::CancelTransfer) => {
-                                self.update_state(
-                                    |e| {
-                                        e.state = State::Cancelled;
-                                    },
-                                    true,
-                                ).await;
-                                self.disconnection().await?;
-                                return Err(anyhow!(crate::errors::AppError::NotAnError));
-                            },
-                            None => {
-                                trace!("inbound: nothing to do")
-                            },
+                                    self.reject_transfer(Some(
+                                        sharing_nearby::connection_response_frame::Status::Reject
+                                    )).await?;
+                                    return Err(anyhow!(crate::errors::AppError::NotAnError));
+                                },
+                                TransferAction::TransferCancel => {
+                                    self.update_state(
+                                        |e| {
+                                            e.state = TransferState::Cancelled;
+                                        },
+                                        true,
+                                    ).await;
+                                    self.disconnection().await?;
+                                    return Err(anyhow!(crate::errors::AppError::NotAnError));
+                                },
+                            }
                         }
+
                     }
                     Err(e) => {
                         error!("inbound: channel error: {}", e);
@@ -151,7 +149,7 @@ impl InboundRequest {
         let current_state = &self.state;
         // Now determine what will be the request type based on current state
         match current_state.state {
-            State::Initial => {
+            TransferState::Initial => {
                 debug!("Handling State::Initial frame");
                 let frame = location_nearby_connections::OfflineFrame::decode(&*frame_data)?;
                 let rdi = self.process_connection_request(&frame)?;
@@ -160,48 +158,48 @@ impl InboundRequest {
                 // Advance current state
                 self.update_state(
                     |e: &mut InnerState| {
-                        e.state = State::ReceivedConnectionRequest;
+                        e.state = TransferState::ReceivedConnectionRequest;
                         e.remote_device_info = Some(rdi);
                     },
                     false,
                 )
                 .await;
             }
-            State::ReceivedConnectionRequest => {
+            TransferState::ReceivedConnectionRequest => {
                 debug!("Handling State::ReceivedConnectionRequest frame");
                 let msg = Ukey2Message::decode(&*frame_data)?;
                 self.process_ukey2_client_init(&msg).await?;
 
                 self.update_state(
                     |e: &mut InnerState| {
-                        e.state = State::SentUkeyServerInit;
+                        e.state = TransferState::SentUkeyServerInit;
                         e.client_init_msg_data = Some(frame_data);
                     },
                     false,
                 )
                 .await;
             }
-            State::SentUkeyServerInit => {
+            TransferState::SentUkeyServerInit => {
                 debug!("Handling State::SentUkeyServerInit frame");
                 let msg = Ukey2Message::decode(&*frame_data)?;
                 self.process_ukey2_client_finish(&msg, &frame_data).await?;
 
                 self.update_state(
                     |e: &mut InnerState| {
-                        e.state = State::ReceivedUkeyClientFinish;
+                        e.state = TransferState::ReceivedUkeyClientFinish;
                     },
                     false,
                 )
                 .await;
             }
-            State::ReceivedUkeyClientFinish => {
+            TransferState::ReceivedUkeyClientFinish => {
                 debug!("Handling State::ReceivedUkeyClientFinish frame");
                 let frame = location_nearby_connections::OfflineFrame::decode(&*frame_data)?;
                 self.process_connection_response(&frame).await?;
 
                 self.update_state(
                     |e: &mut InnerState| {
-                        e.state = State::SentConnectionResponse;
+                        e.state = TransferState::SentConnectionResponse;
                     },
                     false,
                 )
@@ -563,17 +561,15 @@ impl InboundRequest {
                                     == payload_id
                             {
                                 info!("Transfer finished");
-                                let end_index =
-                                    buffer.iter().position(|&b| b == 16).unwrap_or(buffer.len());
-                                let payload = std::str::from_utf8(&buffer[..end_index])?.to_owned();
 
                                 match self.state.text_payload.clone().unwrap() {
                                     TextPayloadInfo::Url(_) => {
+                                        let payload = std::str::from_utf8(&buffer)?.to_owned();
                                         self.update_state(
                                             |e| {
                                                 if let Some(tmd) = e.transfer_metadata.as_mut() {
-                                                    tmd.text_payload = Some(payload);
-                                                    tmd.text_type = Some(TextPayloadType::Url);
+                                                    tmd.payload =
+                                                        Some(TransferPayload::Url(payload));
                                                 }
                                             },
                                             false,
@@ -581,24 +577,74 @@ impl InboundRequest {
                                         .await;
                                     }
                                     TextPayloadInfo::Text(_) => {
+                                        let payload = std::str::from_utf8(&buffer)?.to_owned();
                                         self.update_state(
                                             |e| {
                                                 if let Some(tmd) = e.transfer_metadata.as_mut() {
-                                                    tmd.text_payload = Some(payload);
-                                                    tmd.text_type = Some(TextPayloadType::Text);
+                                                    tmd.payload =
+                                                        Some(TransferPayload::Text(payload));
                                                 }
                                             },
                                             false,
                                         )
                                         .await;
                                     }
-                                    TextPayloadInfo::Wifi((_, ssid)) => {
+                                    // FIXME: ChannelMessage's structure needs to be redone as well
+                                    // It needs to have TextPayloadInfo instead of TextPayloadType
+                                    TextPayloadInfo::Wifi((_, ssid, security_type)) => {
+                                        // ~~Payload seems to be within two DLE (0x10) characters
+                                        // At least for WpaPsk, not sure about Wep~~
+                                        //
+                                        // Nope, that's wrong, my Wi-Fi password just happened to have 16 characters
+                                        // which tripped up the previous logic.
+                                        //
+                                        // So, the password seems to start with 0x0A followed by a byte indicating
+                                        // the password or payload length. And, the payload ends with 0x10 0x??
+                                        // The last byte is sometimes 00 and other times 01
+                                        fn parse_password_payload(
+                                            buffer: &mut Vec<u8>,
+                                        ) -> anyhow::Result<String>
+                                        {
+                                            if buffer.len() < 4 {
+                                                anyhow::bail!("Buffer too short ({buffer:?})");
+                                            }
+
+                                            if buffer[(buffer.len() - 1) - 1] != 0x10 {
+                                                anyhow::bail!(
+                                                    "Buffer ({buffer:?}) doesn't ends with 0x10 0x?? as expected"
+                                                );
+                                            }
+
+                                            let len = *buffer
+                                                .get(1)
+                                                .expect("Validated for minimum length of 4")
+                                                as usize;
+
+                                            let payload_buffer = buffer.get(2..2 + len).with_context(||anyhow!( "Buffer too short ({buffer:?}) can't retrieve payload of length {len}"))?;
+
+                                            Ok(String::from_utf8(payload_buffer.to_owned())?)
+                                        }
+
+                                        let payload = match security_type {
+                                            kind @ SecurityType::UnknownSecurityType => {
+                                                kind.as_str_name().into()
+                                            }
+                                            SecurityType::Open => "".into(),
+                                            SecurityType::WpaPsk | SecurityType::Wep => {
+                                                parse_password_payload(buffer)
+                                                    .inspect_err(|err| error!("{err:#}"))
+                                                    .unwrap_or_default()
+                                            }
+                                        };
+
                                         self.update_state(
                                             |e| {
                                                 if let Some(tmd) = e.transfer_metadata.as_mut() {
-                                                    tmd.text_payload =
-                                                        Some(format!("{ssid}: {}", payload.trim()));
-                                                    tmd.text_type = Some(TextPayloadType::Wifi);
+                                                    tmd.payload = Some(TransferPayload::Wifi {
+                                                        ssid,
+                                                        password: payload,
+                                                        security_type: security_type,
+                                                    });
                                                 }
                                             },
                                             false,
@@ -609,7 +655,7 @@ impl InboundRequest {
 
                                 self.update_state(
                                     |e| {
-                                        e.state = State::Finished;
+                                        e.state = TransferState::Finished;
                                     },
                                     true,
                                 )
@@ -617,9 +663,8 @@ impl InboundRequest {
                                 self.disconnection().await?;
                                 return Err(anyhow!(crate::errors::AppError::NotAnError));
                             } else {
-                                let innner_frame =
-                                    sharing_nearby::Frame::decode(buffer.as_slice())?;
-                                self.process_transfer_setup(&innner_frame).await?;
+                                let inner_frame = sharing_nearby::Frame::decode(buffer.as_slice())?;
+                                self.process_transfer_setup(&inner_frame).await?;
                             }
                         }
                     }
@@ -647,7 +692,9 @@ impl InboundRequest {
                         let chunk_size = chunk.body().len();
                         if current_offset + chunk_size as i64 > file_internal.total_size {
                             return Err(anyhow!(
-                                "Transferred file size exceeds previously specified value: {} vs {}", current_offset + chunk_size as i64, file_internal.total_size
+                                "Transferred file size exceeds previously specified value: {} vs {}",
+                                current_offset + chunk_size as i64,
+                                file_internal.total_size
                             ));
                         }
 
@@ -674,7 +721,7 @@ impl InboundRequest {
                                 info!("Transfer finished");
                                 self.update_state(
                                     |e| {
-                                        e.state = State::Finished;
+                                        e.state = TransferState::Finished;
                                     },
                                     true,
                                 )
@@ -720,7 +767,7 @@ impl InboundRequest {
             info!("Transfer canceled");
             self.update_state(
                 |e| {
-                    e.state = State::Cancelled;
+                    e.state = TransferState::Cancelled;
                 },
                 true,
             )
@@ -730,29 +777,29 @@ impl InboundRequest {
         }
 
         match self.state.state {
-            State::SentConnectionResponse => {
+            TransferState::SentConnectionResponse => {
                 debug!("Processing State::SentConnectionResponse");
                 self.process_paired_key_encryption_frame(v1_frame).await?;
                 self.update_state(
                     |e| {
-                        e.state = State::SentPairedKeyResult;
+                        e.state = TransferState::SentPairedKeyResult;
                     },
                     false,
                 )
                 .await;
             }
-            State::SentPairedKeyResult => {
+            TransferState::SentPairedKeyResult => {
                 debug!("Processing State::SentPairedKeyResult");
                 self.process_paired_key_result(v1_frame).await?;
                 self.update_state(
                     |e| {
-                        e.state = State::ReceivedPairedKeyResult;
+                        e.state = TransferState::ReceivedPairedKeyResult;
                     },
                     false,
                 )
                 .await;
             }
-            State::ReceivedPairedKeyResult => {
+            TransferState::ReceivedPairedKeyResult => {
                 debug!("Processing State::ReceivedPairedKeyResult");
                 self.process_introduction(v1_frame).await?;
             }
@@ -814,7 +861,7 @@ impl InboundRequest {
         // No need to inform the channel here, we'll do it anyway with files info
         self.update_state(
             |e| {
-                e.state = State::WaitingForUserConsent;
+                e.state = TransferState::WaitingForUserConsent;
             },
             false,
         )
@@ -837,7 +884,31 @@ impl InboundRequest {
                     dest.pop();
 
                     loop {
-                        dest.push(format!("{}_{}", counter, file.name()));
+                        // How name conflict resolution happens in most software,
+                        // lorem.txt
+                        // lorem (1).txt
+                        // ...
+                        let incremented_file_path = {
+                            let file_path = PathBuf::from(file.name());
+
+                            let incremented_file_stem = format!(
+                                "{} ({counter})",
+                                file_path
+                                    .file_stem()
+                                    .and_then(|it| it.to_str())
+                                    .expect("Must be UTF-8 since Path is derived from String"),
+                            );
+
+                            let incremented_file_path =
+                                file_path.with_file_name(incremented_file_stem);
+
+                            file_path
+                                .extension()
+                                .map(|it| incremented_file_path.with_extension(it))
+                                .unwrap_or_else(|| incremented_file_path)
+                        };
+
+                        dest.push(incremented_file_path);
                         if !dest.exists() {
                             break;
                         }
@@ -862,18 +933,13 @@ impl InboundRequest {
 
             let metadata = TransferMetadata {
                 id: self.state.id.clone(),
-                destination: Some(
-                    get_download_dir()
-                        .into_os_string()
-                        .into_string()
-                        .map_err(|_| anyhow!("failed to convert PathBuf to String"))?,
-                ),
                 source: self.state.remote_device_info.clone(),
-                files: Some(files_name),
+                payload_kind: TransferPayloadKind::Files,
+                payload_preview: Default::default(),
+                payload: Some(TransferPayload::Files(files_name)),
                 pin_code: self.state.pin_code.clone(),
-                text_description: None,
                 total_bytes,
-                ..Default::default()
+                ack_bytes: Default::default(),
             };
 
             info!("Asking for user consent: {:?}", metadata);
@@ -892,12 +958,13 @@ impl InboundRequest {
                 text_metadata::Type::Url => {
                     let metadata = TransferMetadata {
                         id: self.state.id.clone(),
-                        destination: None,
                         source: self.state.remote_device_info.clone(),
-                        files: None,
+                        payload_kind: TransferPayloadKind::Url,
+                        payload_preview: Some(meta.text_title.clone().unwrap_or_default()),
                         pin_code: self.state.pin_code.clone(),
-                        text_description: meta.text_title.clone(),
-                        ..Default::default()
+                        payload: Default::default(),
+                        total_bytes: Default::default(),
+                        ack_bytes: Default::default(),
                     };
 
                     info!("Asking for user consent: {:?}", metadata);
@@ -915,12 +982,13 @@ impl InboundRequest {
                 | text_metadata::Type::Text => {
                     let metadata = TransferMetadata {
                         id: self.state.id.clone(),
-                        destination: None,
                         source: self.state.remote_device_info.clone(),
-                        files: None,
+                        payload_kind: TransferPayloadKind::Text,
+                        payload_preview: Some(meta.text_title.clone().unwrap_or_default()),
                         pin_code: self.state.pin_code.clone(),
-                        text_description: meta.text_title.clone(),
-                        ..Default::default()
+                        payload: Default::default(),
+                        total_bytes: Default::default(),
+                        ack_bytes: Default::default(),
                     };
 
                     info!("Asking for user consent: {:?}", metadata);
@@ -947,12 +1015,13 @@ impl InboundRequest {
 
             let metadata = TransferMetadata {
                 id: self.state.id.clone(),
-                destination: None,
                 source: self.state.remote_device_info.clone(),
-                files: None,
+                payload_kind: TransferPayloadKind::WiFi,
+                payload_preview: Some(meta.ssid.clone().unwrap_or_default()),
                 pin_code: self.state.pin_code.clone(),
-                text_description: meta.ssid.clone(),
-                ..Default::default()
+                payload: Default::default(),
+                total_bytes: Default::default(),
+                ack_bytes: Default::default(),
             };
 
             self.update_state(
@@ -960,6 +1029,7 @@ impl InboundRequest {
                     e.text_payload = Some(TextPayloadInfo::Wifi((
                         meta.payload_id(),
                         meta.ssid().to_owned(),
+                        meta.security_type(),
                     )));
                     e.transfer_metadata = Some(metadata);
                 },
@@ -1024,7 +1094,7 @@ impl InboundRequest {
 
         self.update_state(
             |e| {
-                e.state = State::ReceivingFiles;
+                e.state = TransferState::ReceivingFiles;
             },
             true,
         )
@@ -1334,11 +1404,11 @@ impl InboundRequest {
         trace!("Sending msg into the channel");
         let _ = self.sender.send(ChannelMessage {
             id: self.state.id.clone(),
-            direction: ChannelDirection::LibToFront,
-            rtype: Some(crate::channel::TransferType::Inbound),
-            state: Some(self.state.state.clone()),
-            meta: self.state.transfer_metadata.clone(),
-            ..Default::default()
+            msg: channel::Message::Client(MessageClient {
+                kind: TransferKind::Inbound,
+                state: Some(self.state.state.clone()),
+                metadata: self.state.transfer_metadata.clone(),
+            }),
         });
         // Add a small sleep timer to allow the Tokio runtime to have
         // some spare time to process channel's message. Otherwise it

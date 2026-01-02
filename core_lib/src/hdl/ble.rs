@@ -36,13 +36,16 @@ impl BleListener {
 
         let mut events = self.adapter.events().await?;
         // Filter on the NearyShare/QuickShare services UUID
-        self.adapter
-            .start_scan(ScanFilter {
-                services: vec![SERVICE_UUID_SHARING],
-            })
-            .await?;
 
-        let mut last_alert = SystemTime::UNIX_EPOCH;
+        // Not using the ScanFilter here to filter out advertisements
+        // not matching the Nearby Share service UUID, it seems to
+        // exclude Nearby Share advertisements despite its UUID being
+        // in the filter.
+        //
+        // Perhaps broken?
+        self.adapter.start_scan(ScanFilter::default()).await?;
+
+        let mut last_alert: SystemTime = SystemTime::UNIX_EPOCH;
 
         loop {
             tokio::select! {
@@ -56,19 +59,23 @@ impl BleListener {
                             // Sanity check as per: https://github.com/Martichou/rquickshare/issues/74
                             // Seems like the filtering is not enough, so we'll add a check before
                             // proceeding with the service_data.
-                            if !service_data.contains_key(&SERVICE_UUID_SHARING) {
-                                continue;
-                            }
+                            //
+                            // ...The filtering is being done only here now.
+                            if let Some(service_data) = service_data.get(&SERVICE_UUID_SHARING) {
+                                let now = SystemTime::now();
+                                // Quick Share seems to emit LE advert every 10 seconds...
+                                // Doesn't really seem much of a spam, so we wait for 10s now
+                                // just in case some implementation is sending it under that
+                                // time period
+                                if now.duration_since(last_alert)? <= Duration::from_secs(10) {
+                                    // debug!("{INNER_NAME}: Received LE advert but last alert was {}s ago", now.duration_since(last_alert)?.as_secs());
+                                    continue;
+                                }
 
-                            let now = SystemTime::now();
-                            // Don't spam, max once per 30s
-                            if now.duration_since(last_alert)? <= Duration::from_secs(30) {
-                                continue;
+                                debug!("{INNER_NAME}: A device ({id}) is sharing ({}) nearby", hex::encode(service_data));
+                                self.sender.send(())?;
+                                last_alert = now;
                             }
-
-                            debug!("{INNER_NAME}: A device ({id}) is sharing ({service_data:?}) nearby");
-                            self.sender.send(())?;
-                            last_alert = now;
                         },
                         // Not interesting for us
                         _ => {

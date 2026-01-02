@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 
+use info::{InternalFileInfo, TransferMetadata};
 use p256::{PublicKey, SecretKey};
-use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
-use self::info::{InternalFileInfo, TransferMetadata};
 use crate::securegcm::ukey2_client_init::CipherCommitment;
+use crate::sharing_nearby::wifi_credentials_metadata::SecurityType;
 use crate::utils::RemoteDeviceInfo;
 
 #[cfg(feature = "experimental")]
@@ -18,7 +17,7 @@ mod blea;
 pub use blea::*;
 mod inbound;
 pub use inbound::*;
-pub(crate) mod info;
+pub mod info;
 mod mdns_discovery;
 pub use mdns_discovery::*;
 mod mdns;
@@ -27,9 +26,8 @@ mod outbound;
 pub use outbound::*;
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Default, Serialize, Deserialize, TS, PartialEq)]
-#[ts(export)]
-pub enum State {
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum TransferState {
     #[default]
     Initial,
     ReceivedConnectionRequest,
@@ -59,7 +57,7 @@ pub struct InnerState {
     pub encryption_done: bool,
 
     // Subject to be used-facing for progress, ...
-    pub state: State,
+    pub state: TransferState,
     pub remote_device_info: Option<RemoteDeviceInfo>,
     pub pin_code: Option<String>,
     pub transfer_metadata: Option<TransferMetadata>,
@@ -89,10 +87,10 @@ pub struct InnerState {
 pub enum TextPayloadInfo {
     Url(i64),
     Text(i64),
-    Wifi((i64, String)),
+    Wifi((i64, String, SecurityType)), // id, ssid, security type
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone)]
 pub enum TextPayloadType {
     Url,
     Text,
@@ -104,7 +102,7 @@ impl TextPayloadInfo {
         match self {
             TextPayloadInfo::Url(value)
             | TextPayloadInfo::Text(value)
-            | TextPayloadInfo::Wifi((value, _)) => value.to_owned(),
+            | TextPayloadInfo::Wifi((value, _, _)) => value.to_owned(),
         }
     }
 }
